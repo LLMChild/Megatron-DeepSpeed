@@ -4,10 +4,11 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.core.enums import ModelType
 from megatron import print_rank_0, get_tokenizer, get_args
 from megatron.core import mpu
 from megatron.core.utils import divide
-from megatron.model import GPTModelPipe, Float16Module
+from megatron.model import GPTModelPipe, GPTModel, Float16Module
 from megatron.utils import unwrap_model
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.arguments import core_transformer_config_from_args
@@ -77,10 +78,10 @@ class refactor:
         self.loaded = loaded
         self.config = config
 
-        self.offset_num = 2
-        self.mega_emb_wnum = 1
-        self.mega_norm_wnum = args.num_layers + 2
-        self.mega_lm_head_wnum = self.mega_norm_wnum + 1
+        self.offset_num = 0
+        self.mega_emb_wnum = "language_model.embedding"
+        self.mega_norm_wnum = "language_model.encoder.final_layernorm"
+        self.mega_lm_head_wnum = "language_model.output_layer"
         self.token_vocab = tokenizer.vocab_size
         self.padded_vocab_size = args.padded_vocab_size
         self.more_padded = self.padded_vocab_size - self.token_vocab
@@ -91,7 +92,7 @@ class refactor:
         self.is_refactored = False
 
     def _embedding_refactor(self, pname, p):
-        if pname == f"{self.mega_lm_head_wnum}.lm_head.weight":
+        if pname == f"{self.mega_lm_head_wnum}.weight":
             hf_name = "lm_head.weight"
         elif pname == f"{self.mega_emb_wnum}.word_embeddings.weight":
             hf_name = "model.embed_tokens.weight"
@@ -108,7 +109,7 @@ class refactor:
             new_w[-self.more_padded:] = hf_w[:self.token_vocab].mean(dim=0, keepdim=True)
 
         self.record_mapping_info(
-            f"mega-ds: {pname,p.data.shape}<--hf: {hf_name,}  [{start_index}:{end_index},:]  of {hf_w.shape}"
+            f"mega-ds: {pname,p.ds_tensor.data.shape}<--hf: {hf_name,}  [{start_index}:{end_index},:]  of {hf_w.shape}"
         )
         return new_w
 
@@ -120,7 +121,7 @@ class refactor:
 
         new_w = hf_w = self.loaded[hf_name]
         self.record_mapping_info(
-            f"mega-ds:{pname,p.data.shape}<--hf{hf_name,}  {hf_w.shape}")
+            f"mega-ds:{pname,p.ds_tensor.data.shape}<--hf{hf_name,}  {hf_w.shape}")
         return new_w
 
     def _qkv_refactor(self, pname, p, hf_layer):
@@ -151,10 +152,10 @@ class refactor:
                     wk[current_index: next_index, :],
                     wv[current_index: next_index, :]
                 ], dim=0)
-        self.record_mapping_info(
-            f"mega-ds:{pname,p.data.shape}<--hf{hf_wq_name,hf_wk_name,hf_wv_name,}  cat q,k,v [{current_index}:{next_index},:]  of q,k,v{wq.shape}"
-        )
-        return new_w
+            self.record_mapping_info(
+                f"mega-ds:{pname,p.ds_tensor.data.shape}<--hf{hf_wq_name,hf_wk_name,hf_wv_name,}  cat q,k,v [{current_index}:{next_index},:]  of q,k,v{wq.shape}"
+            )
+        return new_w.contiguous()
 
     def _mlphto4h_dense_refactor(self, pname, p, hf_layer):
         hf_w_gate_name = f"model.layers.{hf_layer}.mlp.gate_proj.weight"
@@ -174,7 +175,7 @@ class refactor:
                     w_up[start_index:end_index, :]
                 ], dim=0)
         self.record_mapping_info(
-            f"mega-ds:{pname,p.data.shape}<--hf{hf_w_gate_name,hf_w_up_name}  cat gate,up [{start_index}:{end_index},:]  of gate,up{w_gate.shape}"
+            f"mega-ds:{pname,p.ds_tensor.data.shape}<--hf{hf_w_gate_name,hf_w_up_name}  cat gate,up [{start_index}:{end_index},:]  of gate,up{w_gate.shape}"
         )
         return new_w
 
@@ -191,7 +192,7 @@ class refactor:
         new_w = torch.zeros((hf_w.shape[0], per_partition_size), dtype=hf_w.dtype)
         new_w[:, :per_partition_size] = hf_w[:, start_index:end_index]
         self.record_mapping_info(
-            f"mega-ds:{pname,p.data.shape}<--hf{hf_name,}  [:,{start_index}:{end_index}]  of {hf_w.shape}"
+            f"mega-ds:{pname,p.ds_tensor.data.shape}<--hf{hf_name,}  [:,{start_index}:{end_index}]  of {hf_w.shape}"
         )
         return new_w
 
@@ -208,7 +209,7 @@ class refactor:
 
         new_w[:per_partition_size, :] = hf_w[start_index:end_index, :]
         self.record_mapping_info(
-            f"mega-ds:{pname,p.data.shape}<--hf{hf_name,}  [{start_index}:{end_index},:]  of {hf_w.shape}"
+            f"mega-ds:{pname,p.ds_tensor.data.shape}<--hf{hf_name,}  [{start_index}:{end_index},:]  of {hf_w.shape}"
         )
         return new_w
 
@@ -218,15 +219,20 @@ class refactor:
         for pname, p in self.model.named_parameters():
             if pname in [
                     f"{self.mega_emb_wnum}.word_embeddings.weight",
-                    f"{self.mega_lm_head_wnum}.lm_head.weight"
+                    f"{self.mega_lm_head_wnum}.weight"
             ]:
                 new_w = self._embedding_refactor(pname, p)
             elif pname == f"{self.mega_norm_wnum}.weight":
                 new_w = self._direct_refactor(pname, p)
             else:
-                mobj = self.decoder_pat.match(pname)
-                layer_num = int(mobj.group(1))
-                subname = mobj.group(2)
+                mobj = self.decoder_pat.search(pname)
+                try:
+                    layer_num = int(mobj.group(1))
+                    subname = mobj.group(2)
+                except Exception as e:
+                    if torch.distributed.get_rank() == 0:
+                        from IPython import embed;embed()
+                    torch.distributed.barrier()
                 hf_layer = layer_num - self.offset_num
                 if subname in ["self_attention.query_key_value.weight"]:
                     new_w = self._qkv_refactor(pname, p, hf_layer)
@@ -249,7 +255,18 @@ class refactor:
                     new_w = self._direct_refactor(pname, p, hf_layer, subname)
                 else:
                     raise ValueError("Unrecognized weight type")
-            p.data.copy_(new_w)
+            dist = torch.distributed
+            ds_tensor_numel = p.ds_tensor.ds_numel
+            # if torch.distributed.get_world_size() > 1:
+            param_start = dist.get_rank() * ds_tensor_numel
+            param_end = min(p.ds_numel - param_start, ds_tensor_numel)
+            new_w_narrow = new_w.flatten().narrow(0, param_start, param_end)
+            p.ds_tensor.data.copy_(new_w_narrow)
+            # else:
+            #     p.data.copy_(new_w)
+                # if torch.distributed.get_rank() == 0:
+                #     from IPython import embed;embed()
+                # torch.distributed.barrier()
             new_w = None
         self.is_refactored = True
 
@@ -285,8 +302,11 @@ def convert_hf_to_mega_ds():
             config_dict_or_path=args.deepspeed_config,
             enabled=args.zero_stage == 3,
             mpu=mpu):
+        args.model_type = ModelType.encoder_or_decoder
         if args.deepspeed and not args.no_pipeline_parallel:
             model = GPTModelPipe(config, num_tokentypes=0, parallel_output=True)
+        elif args.deepspeed:
+            model = GPTModel(config, num_tokentypes=0, parallel_output=True, pre_process=True, post_process=True)
         else:
             raise NotImplementedError("Not implemented")
 

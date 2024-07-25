@@ -7,8 +7,8 @@ HF_LLAMA_PATH=/data/llama-7b/
 
 MICRO_BATCH_SIZE=16
 GLOBAL_BATCH_SIZE=256
-TP=2
-PP=2
+TP=1
+PP=1
 # require to align with weight dimensions
 HIDDEN_SIZE=4096
 FFN_HIDDEN_SIZE=11008
@@ -35,7 +35,7 @@ cat <<EOT > $DS_CONFIG
   "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
   "steps_per_print": 100,
   "zero_optimization": {
-    "stage": 0
+    "stage": 3
   },
   "bf16": {
     "enabled": true
@@ -85,7 +85,7 @@ comm_args="--tensor-model-parallel-size $TP \
 --save-interval 1500 \
 --split 100,0,0 \
 --bf16 \
---zero-stage 0 \
+--zero-stage 3 \
 --tokenizer-type HFTokenizer \
 --tokenizer-model $HF_LLAMA_PATH \
 --deepspeed_config ./examples_deepspeed/finetune_hf_llama/ds_config.json \
