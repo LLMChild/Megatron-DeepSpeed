@@ -38,9 +38,15 @@ def model_provider(pre_process=True, post_process=True):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
-    with deepspeed.zero.Init(sequence_data_parallel_group=mpu.get_sequence_data_parallel_group(),
+    if hasattr(mpu, 'get_sequence_data_parallel_group'):
+        dpg = mpu.get_sequence_data_parallel_group()
+    elif hasattr(mpu, 'get_data_parallel_group'):
+        dpg = mpu.get_data_parallel_group()
+    else:
+        dpg = None
+    with deepspeed.zero.Init(data_parallel_group=dpg,
                              remote_device=None if args.remote_device == 'none' else args.remote_device,
-                             config_dict_or_path=args.deepspeed_config,
+                             config_dict_or_path=args.deepspeed_config_dict,
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
@@ -92,7 +98,7 @@ def get_batch(data_iterator):
     tokenizer = get_tokenizer()
 
     # Items and their type.
-    keys = ['text']
+    keys = ['input_ids', "labels"]
     datatype = torch.int64
 
     # Broadcast data.
@@ -103,12 +109,11 @@ def get_batch(data_iterator):
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
-    tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+    labels = data_b['labels'].long()[:,1:].contiguous().cuda()
+    tokens = data_b['input_ids'].long()[:,:-1].contiguous().cuda()
     # Get the masks and postition ids.
     skip_mask = args.use_flash_attn or args.use_flash_attn_triton
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+    attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
         args.reset_position_ids,
@@ -116,6 +121,7 @@ def get_batch(data_iterator):
         args.eod_mask_loss,
         skip_mask)
 
+    loss_mask = labels.ne(tokenizer.pad)
     # For DS's sequence parallel
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
     seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
@@ -264,13 +270,11 @@ def forward_step(data_iterator, model):
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
         data_iterator)
     timers('batch-generator').stop()
-
     if args.data_efficiency_curriculum_learning:
         args.curriculum_seqlen = tokens.size()[1]
         if hasattr(args, 'data_efficiency_curriculum_learning_seqlen_type') and \
             args.data_efficiency_curriculum_learning_seqlen_type == 'seqlen_reshape':
             args.data_efficiency_curriculum_learning_numel = torch.numel(tokens)
-
     if args.mos or args.kd:
         # The forward func can return either the loss or the logits, depending on whether passing in the labels or not.
         stu_output, other_losses = model(tokens, position_ids, attention_mask)
